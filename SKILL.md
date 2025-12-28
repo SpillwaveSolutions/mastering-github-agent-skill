@@ -187,6 +187,13 @@ For enterprise CI/CD pipelines:
 - **Separate Build/Deploy Roles** - Fine-grained OIDC permissions
 - **Multi-Stack Ordering** - Foundation → Schemas → Application
 
+**Additional References:**
+- **Workflow Summaries** - Rich markdown output with $GITHUB_STEP_SUMMARY
+- **Container Security** - Multi-stage builds, Trivy scanning, image tagging
+- **Security Scanning** - CodeQL, Dependabot, IaC scanning (Checkov, tfsec)
+- **Troubleshooting** - Debug mode, flaky tests, common issues
+- **Performance** - Limits, runner specs, optimization tips
+
 ---
 
 ## Scripts

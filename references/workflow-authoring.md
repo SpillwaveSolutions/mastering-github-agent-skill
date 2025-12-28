@@ -16,6 +16,11 @@ Comprehensive reference for writing GitHub Actions workflow YAML files.
 - [Expression Reference](#expression-reference)
 - [Production Templates](#production-templates)
 - [Advanced Patterns](#advanced-patterns)
+- [Workflow Summaries](#workflow-summaries)
+- [Container Security](#container-security)
+- [Security Scanning](#security-scanning)
+- [Troubleshooting Guide](#troubleshooting-guide)
+- [Performance Reference](#performance-reference)
 - [Workflow Checklist](#workflow-checklist)
 
 ---
@@ -1080,6 +1085,495 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npx cdk deploy ApplicationStack --require-approval never
+```
+
+---
+
+## Workflow Summaries
+
+Use `$GITHUB_STEP_SUMMARY` for rich markdown summaries in workflow runs.
+
+### Basic Summary
+
+```yaml
+- name: Generate summary
+  run: |
+    echo "## Build Results" >> $GITHUB_STEP_SUMMARY
+    echo "" >> $GITHUB_STEP_SUMMARY
+    echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+    echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+    echo "| Tests | 42 passed |" >> $GITHUB_STEP_SUMMARY
+    echo "| Coverage | 85% |" >> $GITHUB_STEP_SUMMARY
+    echo "| Build time | 2m 30s |" >> $GITHUB_STEP_SUMMARY
+```
+
+### Deployment Summary with Links
+
+```yaml
+- name: Deployment summary
+  run: |
+    cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+    ## Deployment Complete
+
+    | Environment | URL | Status |
+    |------------|-----|--------|
+    | API | https://api-${{ env.ENV_ID }}.example.com | ✅ |
+    | Web | https://web-${{ env.ENV_ID }}.example.com | ✅ |
+
+    ### Resources Created
+    - Database: `myapp-${{ env.ENV_ID }}-db`
+    - Cache: `myapp-${{ env.ENV_ID }}-redis`
+
+    > **Note**: PR environments auto-cleanup when PR is closed
+    EOF
+```
+
+### Test Results Summary
+
+```yaml
+- name: Test results summary
+  if: always()
+  run: |
+    echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+
+    if [ -f test-results.json ]; then
+      PASSED=$(jq '.passed' test-results.json)
+      FAILED=$(jq '.failed' test-results.json)
+
+      echo "" >> $GITHUB_STEP_SUMMARY
+      if [ "$FAILED" -eq 0 ]; then
+        echo "✅ All $PASSED tests passed!" >> $GITHUB_STEP_SUMMARY
+      else
+        echo "❌ $FAILED tests failed out of $((PASSED + FAILED))" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Failed Tests" >> $GITHUB_STEP_SUMMARY
+        jq -r '.failures[] | "- \(.name): \(.message)"' test-results.json >> $GITHUB_STEP_SUMMARY
+      fi
+    fi
+```
+
+---
+
+## Container Security
+
+### Multi-Stage Builds
+
+Minimize attack surface with multi-stage Docker builds.
+
+```dockerfile
+# Build stage
+FROM python:3.11-slim AS builder
+WORKDIR /app
+COPY pyproject.toml poetry.lock ./
+RUN pip install poetry && poetry export -f requirements.txt -o requirements.txt
+COPY . .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Runtime stage - minimal image
+FROM python:3.11-slim AS runtime
+WORKDIR /app
+
+# Non-root user
+RUN addgroup --system app && adduser --system --ingroup app app
+USER app
+
+# Copy only what's needed
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+
+ENTRYPOINT ["python", "-m", "app"]
+```
+
+### Container Scanning with Trivy
+
+```yaml
+name: Container Security
+
+on:
+  push:
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/container-security.yml'
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t myapp:${{ github.sha }} .
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: myapp:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+```
+
+### Image Tagging Strategy
+
+```yaml
+- name: Docker metadata
+  id: meta
+  uses: docker/metadata-action@v5
+  with:
+    images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+    tags: |
+      # Branch name
+      type=ref,event=branch
+      # PR number
+      type=ref,event=pr
+      # Semver tags
+      type=semver,pattern={{version}}
+      type=semver,pattern={{major}}.{{minor}}
+      # SHA for traceability
+      type=sha,prefix=
+
+- name: Build and push
+  uses: docker/build-push-action@v5
+  with:
+    context: .
+    push: true
+    tags: ${{ steps.meta.outputs.tags }}
+    labels: ${{ steps.meta.outputs.labels }}
+```
+
+---
+
+## Security Scanning
+
+### CodeQL Analysis
+
+```yaml
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6 AM
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      matrix:
+        language: [python, javascript]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+```
+
+### Dependabot Configuration
+
+```yaml
+# .github/dependabot.yml
+version: 2
+
+registries:
+  npm-registry:
+    type: npm-registry
+    url: https://npm.pkg.github.com
+    token: ${{ secrets.GITHUB_TOKEN }}
+
+updates:
+  # Python dependencies
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      dev-dependencies:
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "mypy"
+    ignore:
+      - dependency-name: "boto3"
+        update-types: ["version-update:semver-patch"]
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Docker base images
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+### Infrastructure-as-Code Scanning
+
+Scan CDK, Pulumi, Terraform, and CloudFormation for misconfigurations.
+
+```yaml
+name: IaC Security
+
+on:
+  push:
+    paths:
+      - 'infra/**'
+      - 'cdk/**'
+      - '*.tf'
+  pull_request:
+
+jobs:
+  checkov:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/
+          framework: cloudformation,terraform
+          soft_fail: false
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+
+  tfsec:
+    runs-on: ubuntu-latest
+    if: hashFiles('**/*.tf') != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: true
+```
+
+### Branch Protection Status
+
+Update commit status for branch protection integration.
+
+```yaml
+- name: Set commit status
+  uses: actions/github-script@v7
+  with:
+    script: |
+      await github.rest.repos.createCommitStatus({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        sha: context.sha,
+        state: 'success',
+        context: 'security/scan',
+        description: 'All security checks passed',
+        target_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+      });
+```
+
+---
+
+## Troubleshooting Guide
+
+### Flaky Test Handling
+
+```yaml
+- name: Run tests with retry
+  uses: nick-fields/retry@v3
+  with:
+    timeout_minutes: 10
+    max_attempts: 3
+    retry_on: error
+    command: npm test
+
+- name: Run tests (alternative)
+  run: |
+    for i in 1 2 3; do
+      npm test && break
+      echo "Attempt $i failed, retrying..."
+      sleep 5
+    done
+```
+
+### Debug Mode
+
+```yaml
+# Enable step debug logging
+env:
+  ACTIONS_STEP_DEBUG: true
+  ACTIONS_RUNNER_DEBUG: true
+
+# Conditional debug output
+- name: Debug information
+  if: runner.debug == '1'
+  run: |
+    echo "Event: ${{ github.event_name }}"
+    echo "Ref: ${{ github.ref }}"
+    echo "SHA: ${{ github.sha }}"
+    env | sort
+```
+
+### SSH Debug Access
+
+```yaml
+- name: Setup tmate session
+  uses: mxschmitt/action-tmate@v3
+  if: failure()
+  timeout-minutes: 15
+  with:
+    limit-access-to-actor: true
+```
+
+### Common Issues and Solutions
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `Permission denied` | Missing OIDC permissions | Add `id-token: write` to permissions |
+| `Resource not found` | Wrong region/account | Verify AWS_REGION and role ARN |
+| `Rate limit exceeded` | Too many API calls | Add delays, use caching |
+| `Disk space full` | Large artifacts/caches | Clean workspace, prune Docker |
+| `Timeout exceeded` | Long-running step | Increase timeout-minutes |
+| `Cache miss` | Key mismatch | Check hashFiles() paths |
+
+### Disk Space Cleanup
+
+```yaml
+- name: Free disk space
+  run: |
+    sudo rm -rf /usr/share/dotnet
+    sudo rm -rf /opt/ghc
+    sudo rm -rf /usr/local/share/boost
+    docker system prune -af
+    df -h
+```
+
+### Slow Build Optimization
+
+```yaml
+# Use parallel jobs
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm test
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run build
+
+# All run in parallel, total time = max(lint, test, build)
+```
+
+---
+
+## Performance Reference
+
+### GitHub Actions Limits
+
+| Resource | Limit | Notes |
+|----------|-------|-------|
+| Workflow run time | 6 hours | Per workflow |
+| Job execution time | 6 hours | Per job |
+| API requests | 1,000/hour | Per repository |
+| Concurrent jobs | 20 (free) / 500 (enterprise) | Per account |
+| Matrix jobs | 256 | Per workflow |
+| Artifact storage | 500 MB (free) / 2 GB (pro) | Per artifact |
+| Artifact retention | 90 days (default) | Configurable 1-400 days |
+| Cache size | 10 GB | Per repository |
+| Log retention | 400 days (public) / 90 days (private) | |
+
+### Runner Specifications
+
+| Runner | vCPU | RAM | Storage | Cost |
+|--------|------|-----|---------|------|
+| ubuntu-latest | 4 | 16 GB | 14 GB SSD | Free tier available |
+| ubuntu-24.04 | 4 | 16 GB | 14 GB SSD | Free tier available |
+| windows-latest | 4 | 16 GB | 14 GB SSD | 2x Linux minutes |
+| macos-latest | 3 | 14 GB | 14 GB SSD | 10x Linux minutes |
+| macos-14 (M1) | 3 | 7 GB | 14 GB SSD | 10x Linux minutes |
+
+### Optimization Tips
+
+| Technique | Time Saved | Implementation |
+|-----------|------------|----------------|
+| Dependency caching | 30-70% | actions/cache with hashFiles |
+| Parallel jobs | 40-60% | Split independent work |
+| Docker layer caching | 50-80% | cache-from: type=gha |
+| Shallow clone | 10-30% | fetch-depth: 1 |
+| Skip unnecessary runs | 100% | paths-ignore, conditional |
+| Self-hosted runners | Variable | For specialized hardware |
+
+### Package Manager Detection
+
+Dynamically detect and use the correct package manager.
+
+```yaml
+- name: Detect package manager
+  id: detect-pm
+  run: |
+    if [ -f "pnpm-lock.yaml" ]; then
+      echo "manager=pnpm" >> $GITHUB_OUTPUT
+      echo "command=pnpm install --frozen-lockfile" >> $GITHUB_OUTPUT
+    elif [ -f "yarn.lock" ]; then
+      echo "manager=yarn" >> $GITHUB_OUTPUT
+      echo "command=yarn install --frozen-lockfile" >> $GITHUB_OUTPUT
+    else
+      echo "manager=npm" >> $GITHUB_OUTPUT
+      echo "command=npm ci" >> $GITHUB_OUTPUT
+    fi
+
+- uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: ${{ steps.detect-pm.outputs.manager }}
+
+- run: ${{ steps.detect-pm.outputs.command }}
 ```
 
 ---
