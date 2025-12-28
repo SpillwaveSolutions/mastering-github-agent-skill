@@ -175,6 +175,18 @@ steps:
 
 **Full reference:** [references/workflow-authoring.md](references/workflow-authoring.md)
 
+### Advanced Patterns
+
+For enterprise CI/CD pipelines:
+
+- **Ephemeral PR Environments** - Auto-create/destroy per PR
+- **Release Please** - Automated semantic versioning
+- **PR Cleanup** - Resource cleanup on close
+- **Testing Patterns** - pytest, Gradle, Jest with coverage
+- **Deployment Status Checks** - Wait for stack readiness
+- **Separate Build/Deploy Roles** - Fine-grained OIDC permissions
+- **Multi-Stack Ordering** - Foundation → Schemas → Application
+
 ---
 
 ## Scripts

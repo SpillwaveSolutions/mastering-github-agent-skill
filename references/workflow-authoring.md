@@ -15,6 +15,8 @@ Comprehensive reference for writing GitHub Actions workflow YAML files.
 - [Common Patterns](#common-patterns)
 - [Expression Reference](#expression-reference)
 - [Production Templates](#production-templates)
+- [Advanced Patterns](#advanced-patterns)
+- [Workflow Checklist](#workflow-checklist)
 
 ---
 
@@ -706,4 +708,395 @@ jobs:
       - run: poetry run pytest
 ```
 
-See [workflow_templates.md](workflow_templates.md) for additional production-ready templates.
+---
+
+## Advanced Patterns
+
+### Ephemeral PR Environments
+
+Create isolated environments per pull request with automatic cleanup.
+
+#### Compute Environment Identifier
+
+```yaml
+# .github/actions/compute-identifier/action.yml
+name: 'Compute Identifier'
+description: 'Compute namespaced environment identifier'
+
+outputs:
+  identifier:
+    description: 'Environment identifier'
+    value: ${{ steps.compute.outputs.identifier }}
+  is-ephemeral:
+    description: 'Whether this is an ephemeral environment'
+    value: ${{ steps.compute.outputs.is-ephemeral }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: compute
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "identifier=pr${{ github.event.number }}" >> $GITHUB_OUTPUT
+          echo "is-ephemeral=true" >> $GITHUB_OUTPUT
+        elif [ "${{ github.ref_name }}" = "main" ]; then
+          echo "identifier=main" >> $GITHUB_OUTPUT
+          echo "is-ephemeral=false" >> $GITHUB_OUTPUT
+        else
+          echo "identifier=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          echo "is-ephemeral=true" >> $GITHUB_OUTPUT
+        fi
+```
+
+#### Use identifier in workflows
+
+```yaml
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      identifier: ${{ steps.id.outputs.identifier }}
+      is-ephemeral: ${{ steps.id.outputs.is-ephemeral }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/compute-identifier
+        id: id
+
+  deploy:
+    needs: setup
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_ID: ${{ needs.setup.outputs.identifier }}
+    steps:
+      - run: |
+          echo "Deploying to environment: $RESOURCE_ID"
+          # Resources named: myapp-$RESOURCE_ID-*
+```
+
+### PR Cleanup on Close
+
+Automatically destroy ephemeral resources when PR is closed/merged.
+
+```yaml
+name: Cleanup PR Environment
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_ID: pr${{ github.event.number }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_CLEANUP }}
+          aws-region: us-east-1
+
+      # Destroy in reverse order: app → schemas → foundation
+      - name: Destroy application stack
+        run: |
+          aws cloudformation delete-stack --stack-name "app-${RESOURCE_ID}" || true
+          aws cloudformation wait stack-delete-complete --stack-name "app-${RESOURCE_ID}" || true
+
+      - name: Destroy foundation stack
+        run: |
+          aws cloudformation delete-stack --stack-name "foundation-${RESOURCE_ID}" || true
+          aws cloudformation wait stack-delete-complete --stack-name "foundation-${RESOURCE_ID}" || true
+
+      - name: Clean up SSM parameters
+        run: |
+          PARAMS=$(aws ssm get-parameters-by-path --path "/myapp/${RESOURCE_ID}" --recursive --query 'Parameters[].Name' --output text)
+          if [ -n "$PARAMS" ]; then
+            aws ssm delete-parameters --names $PARAMS || true
+          fi
+```
+
+### Release Please Integration
+
+Automate semantic versioning based on conventional commits.
+
+```yaml
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: node  # or: python, simple, etc.
+
+  # Deploy only when release is created
+  deploy:
+    needs: release
+    if: ${{ needs.release.outputs.release_created }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "Deploying version ${{ needs.release.outputs.version }}"
+```
+
+#### Monorepo with manifest
+
+```yaml
+# release-please-config.json
+{
+  "packages": {
+    "packages/api": {
+      "release-type": "python"
+    },
+    "packages/web": {
+      "release-type": "node"
+    }
+  },
+  "linked-versions": true
+}
+```
+
+### Testing Patterns
+
+#### Python with pytest and coverage
+
+```yaml
+name: Python Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install
+
+      - name: Run tests with coverage
+        run: |
+          poetry run pytest -q --cov=src --cov-report=xml --cov-report=term
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+```
+
+#### Java/Kotlin with Gradle
+
+```yaml
+name: Gradle Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Run tests
+        run: ./gradlew test check
+
+      - name: Publish test report
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: '**/build/test-results/test/TEST-*.xml'
+```
+
+#### TypeScript with Jest
+
+```yaml
+name: TypeScript Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npx tsc --noEmit  # Type check
+      - run: npm test -- --coverage
+
+      - uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/coverage-final.json
+```
+
+### Deployment Status Checks
+
+Wait for infrastructure to be ready before deploying.
+
+```yaml
+- name: Wait for stack ready
+  run: |
+    STACK_NAME="foundation-${RESOURCE_ID}"
+    MAX_ATTEMPTS=30
+    ATTEMPT=0
+
+    while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+      STATUS=$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --query 'Stacks[0].StackStatus' \
+        --output text 2>/dev/null || echo "NOT_FOUND")
+
+      case "$STATUS" in
+        CREATE_COMPLETE|UPDATE_COMPLETE)
+          echo "Stack ready: $STATUS"
+          exit 0
+          ;;
+        *_IN_PROGRESS)
+          echo "Waiting... Status: $STATUS"
+          sleep 30
+          ;;
+        *_FAILED|ROLLBACK_*)
+          echo "Stack failed: $STATUS"
+          exit 1
+          ;;
+        NOT_FOUND)
+          echo "Stack not found, waiting..."
+          sleep 30
+          ;;
+      esac
+      ATTEMPT=$((ATTEMPT + 1))
+    done
+    echo "Timeout waiting for stack"
+    exit 1
+```
+
+### Separate Build vs Deploy Roles
+
+Use fine-grained OIDC roles for different workflow phases.
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Build role: ECR push + SSM write only
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_BUILD }}
+          aws-region: us-east-1
+
+      - name: Build and push image
+        run: |
+          docker build -t $ECR_REPO:$VERSION .
+          docker push $ECR_REPO:$VERSION
+          aws ssm put-parameter --name "/app/version" --value "$VERSION" --overwrite
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Deploy role: CloudFormation + broader permissions
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEPLOY }}
+          aws-region: us-east-1
+
+      - name: Deploy stack
+        run: npx cdk deploy --require-approval never
+```
+
+### Ordered Multi-Stack Deployment
+
+Deploy stacks in dependency order with wait checks.
+
+```yaml
+name: Deploy All Stacks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx cdk deploy FoundationStack --require-approval never
+
+  schemas:
+    needs: foundation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx cdk deploy SchemasStack --require-approval never
+
+  application:
+    needs: schemas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx cdk deploy ApplicationStack --require-approval never
+```
+
+---
+
+## Workflow Checklist
+
+Before deploying a new workflow, verify:
+
+```
+- [ ] Uses concurrency control to prevent parallel runs
+- [ ] Has explicit permissions (not default)
+- [ ] Actions pinned to SHA or major version
+- [ ] Secrets accessed via ${{ secrets.* }}
+- [ ] Environment variables use ${{ env.* }} or ${{ vars.* }}
+- [ ] Cleanup jobs tolerate failures (|| true)
+- [ ] Tests run before deployment
+- [ ] PR environments auto-cleanup on close
+- [ ] Build and deploy use separate OIDC roles
+- [ ] Stacks deploy in dependency order
+```
